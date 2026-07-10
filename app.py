@@ -1,94 +1,135 @@
 import os
+import json
+import logging
 import subprocess
 import requests
-import json
 from flask import Flask, render_template, request, jsonify
+from datetime import datetime
 
+# ========= CONFIGURAÇÕES =========
 app = Flask(__name__)
 
-# ========= CONFIGURAÇÕES DA API =========
-# Use variável de ambiente para a chave (seguro)
-API_KEY = os.getenv("LENIOR_API_KEY", "")
+# Carrega a chave da API de forma segura
+API_KEY = os.getenv("LENIOR_API_KEY")
 if not API_KEY:
-    print("⚠️  ATENÇÃO: LENIOR_API_KEY não definida. A IA não funcionará.")
+    logging.warning("LENIOR_API_KEY não definida. Use variável de ambiente.")
 
-# Altere a URL se estiver usando outro provedor
-API_URL = os.getenv("API_URL", "https://api.openai.com/v1/chat/completions")
+# Escolha o provedor: 'openai', 'gemini', ou 'local'
+PROVIDER = os.getenv("LENIOR_PROVIDER", "openai").lower()
+API_URLS = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+    "local": "http://localhost:11434/api/generate"  # para Ollama
+}
+API_URL = API_URLS.get(PROVIDER, API_URLS["openai"])
+
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Memória simples (em produção use Redis)
+historico = []
 
 # ========= FUNÇÕES DA IA =========
 def chamar_api(mensagens, temperatura=0.7, max_tokens=500):
-    if not API_KEY:
-        return "Erro: Chave de API não configurada."
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "gpt-3.5-turbo",  # Ou o modelo disponível
-        "messages": mensagens,
-        "temperature": temperatura,
-        "max_tokens": max_tokens
-    }
+    """Chama a API configurada com fallback."""
     try:
-        resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except requests.exceptions.Timeout:
-        return "Erro: Tempo limite excedido ao chamar a API."
-    except requests.exceptions.RequestException as e:
-        return f"Erro na requisição: {e}"
-    except (KeyError, json.JSONDecodeError) as e:
-        return f"Erro ao processar resposta da API: {e}"
+        if PROVIDER == "openai":
+            headers = {
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "gpt-3.5-turbo",
+                "messages": mensagens,
+                "temperature": temperatura,
+                "max_tokens": max_tokens
+            }
+            resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        
+        elif PROVIDER == "gemini":
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [{"parts": [{"text": mensagens[-1]["content"]}]}]
+            }
+            params = {"key": API_KEY}
+            resp = requests.post(API_URL, headers=headers, json=payload, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        
+        elif PROVIDER == "local":
+            # Para Ollama ou similar
+            payload = {
+                "model": "llama2",
+                "prompt": mensagens[-1]["content"],
+                "stream": False
+            }
+            resp = requests.post(API_URL, json=payload, timeout=60)
+            resp.raise_for_status()
+            return resp.json()["response"].strip()
+        
+        else:
+            return "Provedor não suportado."
+    
+    except Exception as e:
+        logger.error(f"Erro na API: {e}")
+        return f"Erro ao contactar IA: {str(e)}"
 
 def conversar(pergunta):
+    """Conversa normal com contexto."""
     mensagens = [
-        {"role": "system", "content": "Você é o LENIOR, um assistente pessoal inteligente, prestativo e educado. Responda em português."},
+        {"role": "system", "content": "Você é o LENIOR, assistente pessoal inteligente, educado e prestativo. Responda em português brasileiro."},
+        *historico[-5:],  # Últimas 5 trocas para contexto
         {"role": "user", "content": pergunta}
     ]
-    return chamar_api(mensagens)
+    resposta = chamar_api(mensagens)
+    historico.append({"role": "user", "content": pergunta})
+    historico.append({"role": "assistant", "content": resposta})
+    return resposta
 
 def gerar_codigo(descricao):
-    prompt = f"Escreva apenas o código (sem explicações extras) para: {descricao}. Use a linguagem apropriada."
+    """Gera código limpo e funcional."""
+    prompt = f"Escreva apenas o código (sem explicações) para: {descricao}. Use a linguagem apropriada e inclua comentários se relevante."
     mensagens = [
-        {"role": "system", "content": "Você é um especialista em programação. Gere código limpo e funcional."},
+        {"role": "system", "content": "Você é um especialista em programação. Gere código otimizado e bem comentado."},
         {"role": "user", "content": prompt}
     ]
     return chamar_api(mensagens, temperatura=0.3, max_tokens=1000)
 
 def executar_comando(comando):
-    """
-    Executa um comando no sistema operacional.
-    Atenção: só execute comandos confiáveis!
-    """
+    """Executa comando no sistema com segurança."""
     try:
-        # Limita comandos para maior segurança (opcional)
-        comandos_permitidos = ["notepad", "calc", "explorer", "echo", "dir", "ls", "whoami"]
-        # Se o comando não começar com um permitido, pode recusar
-        # Vamos apenas executar com shell
+        # Lista de comandos proibidos (pode expandir)
+        proibidos = ["rm -rf", "del /f", "format", "shutdown", "reboot"]
+        for proibido in proibidos:
+            if proibido in comando.lower():
+                return "❌ Comando bloqueado por segurança."
+
         if os.name == 'nt':
             processo = subprocess.run(comando, shell=True, capture_output=True, text=True, check=False)
         else:
             processo = subprocess.run(['sh', '-c', comando], capture_output=True, text=True, check=False)
+        
         if processo.returncode == 0:
-            return processo.stdout.strip() or "Comando executado com sucesso."
+            return processo.stdout.strip() or "✅ Comando executado com sucesso."
         else:
-            return f"Erro (código {processo.returncode}): {processo.stderr.strip()}"
+            return f"❌ Erro: {processo.stderr.strip()}"
     except Exception as e:
-        return f"Falha ao executar: {e}"
+        logger.error(f"Erro ao executar comando: {e}")
+        return f"❌ Falha ao executar: {e}"
 
 def identificar_intencao(entrada):
-    """
-    Usa a IA para classificar a intenção do usuário.
-    """
+    """Classifica a intenção do usuário usando IA."""
     prompt = f"""
-Classifique a intenção da seguinte frase do usuário em uma destas categorias:
-- "conversar" (perguntas gerais, bate-papo)
-- "codigo" (pedidos para escrever código, programar)
-- "comando" (ações no computador, abrir programas, executar algo)
+Classifique a intenção da seguinte frase em uma destas categorias (responda apenas com a categoria):
+- "conversar" (perguntas, bate-papo, opiniões)
+- "codigo" (pedido para escrever código, programar)
+- "comando" (ações no computador, abrir programas, executar)
 
 Frase: "{entrada}"
-Resposta apenas com a categoria (exatamente uma palavra):
+Categoria:
 """
     mensagens = [
         {"role": "system", "content": "Você classifica intenções."},
@@ -110,57 +151,52 @@ def index():
 
 @app.route('/api/lenior', methods=['POST'])
 def lenior_api():
-    data = request.get_json()
-    if not data or 'mensagem' not in data:
-        return jsonify({'erro': 'Mensagem não fornecida'}), 400
-
-    mensagem_usuario = data['mensagem'].strip()
-    if not mensagem_usuario:
+    data = request.json
+    mensagem = data.get('mensagem', '').strip()
+    if not mensagem:
         return jsonify({'erro': 'Mensagem vazia'}), 400
 
-    # 1. Classifica intenção
-    intencao = identificar_intencao(mensagem_usuario)
+    # Log da requisição
+    logger.info(f"Usuário: {mensagem}")
+
+    intencao = identificar_intencao(mensagem)
     resposta = ""
-    tipo_resposta = "texto"
+    tipo = "texto"
     comando_confirmar = None
 
-    try:
-        if intencao == "codigo":
-            tipo_resposta = "codigo"
-            resposta = gerar_codigo(mensagem_usuario)
-        elif intencao == "comando":
-            tipo_resposta = "comando"
-            comando_confirmar = mensagem_usuario
-            resposta = f"Quer executar o comando: '{mensagem_usuario}' ?"
-        else:
-            tipo_resposta = "texto"
-            resposta = conversar(mensagem_usuario)
-    except Exception as e:
-        return jsonify({'erro': f'Erro interno: {e}'}), 500
+    if intencao == "codigo":
+        tipo = "codigo"
+        resposta = gerar_codigo(mensagem)
+    elif intencao == "comando":
+        tipo = "comando"
+        comando_confirmar = mensagem
+        resposta = f"⚠️ Deseja executar: '{mensagem}' ?"
+    else:
+        tipo = "texto"
+        resposta = conversar(mensagem)
 
     return jsonify({
         'resposta': resposta,
-        'tipo': tipo_resposta,
+        'tipo': tipo,
         'comando': comando_confirmar
     })
 
 @app.route('/api/executar', methods=['POST'])
 def executar():
-    data = request.get_json()
-    if not data or 'comando' not in data:
-        return jsonify({'erro': 'Comando não fornecido'}), 400
-
-    comando = data['comando'].strip()
+    data = request.json
+    comando = data.get('comando', '').strip()
     if not comando:
         return jsonify({'erro': 'Comando vazio'}), 400
-
-    # Executa e retorna o resultado
+    
     resultado = executar_comando(comando)
     return jsonify({'resultado': resultado})
 
-# ========= INÍCIO DA APLICAÇÃO =========
+@app.route('/api/historico', methods=['GET'])
+def get_historico():
+    """Retorna o histórico de conversas (opcional)."""
+    return jsonify(historico)
+
+# ========= INICIALIZAÇÃO =========
 if __name__ == '__main__':
-    # A porta é fornecida pelo Render via variável de ambiente PORT
     port = int(os.environ.get('PORT', 5000))
-    # Em produção, debug deve ser False
     app.run(host='0.0.0.0', port=port, debug=False)
