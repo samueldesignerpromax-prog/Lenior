@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: lenior
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: LENIOR_API_KEY
+        sync: false
+      - key: LENIOR_PROVIDER
+        value: openai
